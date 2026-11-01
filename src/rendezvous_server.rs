@@ -478,6 +478,21 @@ impl RendezvousServer {
                 }
                 Some(rendezvous_message::Union::PunchHoleSent(phs)) => {
                     // UDP PunchHoleSent is intentionally unsupported to avoid UDP reflection/amplification
+                    // DiceX: except as B's answer to a UDP punch, which goes to A over TCP only.
+                    self.handle_udp_hole_sent(phs, addr).await;
+                }
+                Some(rendezvous_message::Union::TestNatRequest(_)) => {
+                    // DiceX: the UDP NAT test, so clients learn the public port of the socket
+                    // they offer for a UDP punch. Only the port goes back, and only when the
+                    // reply is no larger than the request, so it cannot amplify.
+                    let mut msg_out = RendezvousMessage::new();
+                    msg_out.set_test_nat_response(TestNatResponse {
+                        port: addr.port() as _,
+                        ..Default::default()
+                    });
+                    if msg_out.compute_size() as usize <= bytes.len() {
+                        allow_err!(socket.send(&msg_out, addr).await);
+                    }
                 }
                 Some(rendezvous_message::Union::LocalAddr(la)) => {
                     // UDP LocalAddr is intentionally unsupported to avoid UDP reflection/amplification
@@ -672,6 +687,7 @@ impl RendezvousServer {
             socket_addr: AddrMangle::encode(addr).into(),
             pk: self.get_pk(&phs.version, phs.id).await,
             relay_server: phs.relay_server.clone(),
+            socket_addr_v6: dicex_public_v6(phs.socket_addr_v6),
             ..Default::default()
         };
         if let Ok(t) = phs.nat_type.enum_value() {
@@ -684,6 +700,32 @@ impl RendezvousServer {
             self.send_to_tcp(msg_out, addr_a).await;
         }
         Ok(())
+    }
+
+    /// DiceX: B's `PunchHoleSent` for a UDP punch. B sends it from the socket it punches with, so
+    /// its source is B's public UDP endpoint. A hears of it only on the TCP connection its request
+    /// came on, never over UDP, so nothing is reflected to an address named in the datagram.
+    async fn handle_udp_hole_sent(&mut self, phs: PunchHoleSent, addr: SocketAddr) {
+        let addr_a = AddrMangle::decode(&phs.socket_addr);
+        // B sends it up to three times; only the first still finds A waiting.
+        if !self.tcp_punch.lock().await.contains_key(&try_into_v4(addr_a)) {
+            return;
+        }
+        log::debug!("UDP punch hole response to {:?} from {:?}", &addr_a, &addr);
+        let mut msg_out = RendezvousMessage::new();
+        let mut p = PunchHoleResponse {
+            socket_addr: AddrMangle::encode(addr).into(),
+            pk: self.get_pk(&phs.version, phs.id).await,
+            relay_server: phs.relay_server,
+            is_udp: true,
+            socket_addr_v6: dicex_public_v6(phs.socket_addr_v6),
+            ..Default::default()
+        };
+        if let Ok(t) = phs.nat_type.enum_value() {
+            p.set_nat_type(t);
+        }
+        msg_out.set_punch_hole_response(p);
+        self.send_to_tcp(msg_out, addr_a).await;
     }
 
     #[inline]
@@ -706,6 +748,7 @@ impl RendezvousServer {
             socket_addr: la.local_addr.clone(),
             pk: self.get_pk(&la.version, la.id).await,
             relay_server: la.relay_server,
+            socket_addr_v6: dicex_public_v6(la.socket_addr_v6),
             ..Default::default()
         };
         p.set_is_local(true);
@@ -774,7 +817,18 @@ impl RendezvousServer {
                     relay_server = self.inner.local_ip.clone()
                 }
                 ph.nat_type = NatType::SYMMETRIC.into(); // will force relay
+                // DiceX: and no UDP or IPv6 punch either.
+                ph.force_relay = true;
             }
+            // DiceX: pass on what A offers for a UDP and an IPv6 punch (see handle_udp_hole_sent).
+            let (udp_port, socket_addr_v6) = if ph.force_relay {
+                (0, Bytes::new())
+            } else {
+                (
+                    if (1..=65535).contains(&ph.udp_port) { ph.udp_port } else { 0 },
+                    dicex_public_v6(ph.socket_addr_v6),
+                )
+            };
             let same_intranet: bool = !ws
                 && (peer_is_lan && is_lan || {
                     match (peer_addr, addr) {
@@ -794,6 +848,7 @@ impl RendezvousServer {
                 msg_out.set_fetch_local_addr(FetchLocalAddr {
                     socket_addr,
                     relay_server,
+                    socket_addr_v6,
                     ..Default::default()
                 });
             } else {
@@ -807,6 +862,9 @@ impl RendezvousServer {
                     socket_addr,
                     nat_type: ph.nat_type,
                     relay_server,
+                    udp_port,
+                    force_relay: ph.force_relay,
+                    socket_addr_v6,
                     ..Default::default()
                 });
             }
@@ -1392,6 +1450,19 @@ async fn send_rk_res(
     socket.send(&msg_out, addr).await
 }
 
+/// DiceX: a peer's own IPv6 punch address, passed on only when it is a public unicast address
+/// (2000::/3) with a port; anything else would send the other peer's probes where the sender likes.
+fn dicex_public_v6(bytes: Bytes) -> Bytes {
+    if bytes.len() == 18 {
+        if let SocketAddr::V6(a) = AddrMangle::decode(&bytes) {
+            if a.port() > 0 && (a.ip().segments()[0] & 0xe000) == 0x2000 {
+                return bytes;
+            }
+        }
+    }
+    Bytes::new()
+}
+
 async fn create_udp_listener(
     bind_addr: Option<IpAddr>,
     port: i32,
@@ -1449,6 +1520,43 @@ mod tests {
             // the oldest half is evicted and the newest kept
             assert_eq!(lock.front().unwrap().to_id, format!("peer{}", max % 31));
             assert_eq!(lock.back().unwrap().to_id, format!("peer{}", (max * 2 - 1) % 31));
+        }
+    }
+
+    // DiceX Remote pads its UDP NAT test with `serial: i32::MAX` so the reply fits; a bare
+    // request gets none.
+    #[test]
+    fn udp_nat_test_reply_fits_only_a_padded_request() {
+        let mut res = RendezvousMessage::new();
+        res.set_test_nat_response(TestNatResponse {
+            port: 65535,
+            ..Default::default()
+        });
+        let mut padded = RendezvousMessage::new();
+        padded.set_test_nat_request(TestNatRequest {
+            serial: i32::MAX,
+            ..Default::default()
+        });
+        let mut bare = RendezvousMessage::new();
+        bare.set_test_nat_request(TestNatRequest::default());
+        assert!(res.compute_size() <= padded.compute_size());
+        assert!(res.compute_size() > bare.compute_size());
+    }
+
+    #[test]
+    fn dicex_public_v6_passes_only_public_unicast() {
+        let ok: SocketAddr = "[2001:db8::1]:4000".parse().unwrap();
+        let ok = Bytes::from(AddrMangle::encode(ok));
+        assert_eq!(dicex_public_v6(ok.clone()), ok);
+        for bad in [
+            "[fe80::1]:4000",
+            "[fd00::1]:4000",
+            "[::1]:4000",
+            "[2001:db8::1]:0",
+            "1.2.3.4:4000",
+        ] {
+            let a: SocketAddr = bad.parse().unwrap();
+            assert!(dicex_public_v6(Bytes::from(AddrMangle::encode(a))).is_empty(), "{bad}");
         }
     }
 }
