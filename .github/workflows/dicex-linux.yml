@@ -1,0 +1,51 @@
+# DiceX Remote: hbbs/hbbr for DiceX's own Linux server (x86_64 Ubuntu).
+#
+# A trimmed `build` job from build.yaml: one target, no Docker images or releases. The binaries
+# replace /usr/bin/hbbs and /usr/bin/hbbr from the official rustdesk-server deb on the server, so
+# the systemd units and data folder stay as the deb set them up (see HANDOFF.md of DiceX Remote).
+
+name: DiceX Remote server - Linux x64
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - dicex
+
+concurrency:
+  group: dicex-linux-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout source code
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          submodules: recursive
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+        with:
+          toolchain: stable
+
+      - name: Test
+        run: cargo test --release
+
+      - name: Build
+        run: |
+          cargo build --release --bins
+          strip target/release/hbbs target/release/hbbr
+          sha256sum target/release/hbbs target/release/hbbr
+
+      - name: Upload binaries
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: dicex-remote-server-linux-x64
+          path: |
+            target/release/hbbs
+            target/release/hbbr
